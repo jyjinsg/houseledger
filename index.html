@@ -381,34 +381,62 @@
 
 </div>
 
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <script>
+  // ── Supabase 클라이언트 ───────────────────────────────
+  const SUPABASE_URL = 'https://bjuhnvfftyytelpklgyp.supabase.co';
+  const SUPABASE_KEY = 'sb_publishable_g1UNlr3RFV3UTuwYzeUdFA_isg55n3W';
+  const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+
   // ── 상태 ──────────────────────────────────────────────
   let currentTab = 'income';
   let currentFilter = 'all';
+  let cachedData = [];   // 현재 월에 로드된 거래내역 캐시
 
   const today = new Date();
   let viewYear  = today.getFullYear();
   let viewMonth = today.getMonth(); // 0-based
 
-  // localStorage key별 데이터
-  function storageKey(year, month) {
-    return `houseledger_${year}_${String(month+1).padStart(2,'0')}`;
-  }
-  function carryKey(year, month) {
-    return `houseledger_carry_${year}_${String(month+1).padStart(2,'0')}`;
+  // ── 데이터 접근 (Supabase) ────────────────────────────
+  // 현재 보고 있는 연/월의 [시작일, 다음달 1일) 범위를 반환
+  function monthRange(year, month) {
+    const pad = n => String(n).padStart(2, '0');
+    const start = `${year}-${pad(month + 1)}-01`;
+    const ny = month === 11 ? year + 1 : year;
+    const nm = month === 11 ? 1 : month + 2;     // 다음 달 (1-based)
+    const end = `${ny}-${pad(nm)}-01`;
+    return { start, end };
   }
 
-  function loadData() {
-    return JSON.parse(localStorage.getItem(storageKey(viewYear, viewMonth)) || '[]');
+  async function loadData() {
+    const { start, end } = monthRange(viewYear, viewMonth);
+    const { data, error } = await sb
+      .from('transactions')
+      .select('*')
+      .gte('date', start)
+      .lt('date', end)
+      .order('date', { ascending: false })
+      .order('created_at', { ascending: false });
+    if (error) { console.error(error); alert('내역을 불러오지 못했습니다: ' + error.message); return []; }
+    return data || [];
   }
-  function saveData(data) {
-    localStorage.setItem(storageKey(viewYear, viewMonth), JSON.stringify(data));
+
+  async function loadCarry() {
+    const { data, error } = await sb
+      .from('monthly_carryover')
+      .select('amount')
+      .eq('year', viewYear)
+      .eq('month', viewMonth + 1)
+      .maybeSingle();
+    if (error) { console.error(error); return 0; }
+    return data ? data.amount : 0;
   }
-  function loadCarry() {
-    return parseInt(localStorage.getItem(carryKey(viewYear, viewMonth)) || '0');
-  }
-  function saveCarry(v) {
-    localStorage.setItem(carryKey(viewYear, viewMonth), String(v));
+
+  async function saveCarry(v) {
+    const { error } = await sb
+      .from('monthly_carryover')
+      .upsert({ year: viewYear, month: viewMonth + 1, amount: v, updated_at: new Date().toISOString() });
+    if (error) { console.error(error); alert('이월금액 저장 실패: ' + error.message); }
   }
 
   // ── 포맷 ──────────────────────────────────────────────
@@ -442,49 +470,57 @@
     document.querySelectorAll('.filter-btn').forEach(btn => {
       btn.classList.toggle('on', btn.dataset.filter === f);
     });
-    renderList(loadData());
+    renderList(cachedData);
   }
 
   // ── 추가 ─────────────────────────────────────────────
-  function addTransaction() {
+  async function addTransaction() {
     const desc   = document.getElementById('desc').value.trim();
     const amount = parseInt(document.getElementById('amount').value);
     const cat    = document.getElementById('category').value;
     const date   = document.getElementById('date').value;
 
-    if (!desc)              { alert('내용을 입력해주세요.'); return; }
+    if (!desc)                  { alert('내용을 입력해주세요.'); return; }
     if (!amount || amount <= 0) { alert('올바른 금액을 입력해주세요.'); return; }
-    if (!date)              { alert('날짜를 선택해주세요.'); return; }
+    if (!date)                  { alert('날짜를 선택해주세요.'); return; }
 
-    const data = loadData();
-    data.push({ id: Date.now(), desc, amount, type: currentTab, category: cat, date });
-    saveData(data);
-    render();
+    const { error } = await sb.from('transactions').insert({
+      description: desc, amount, type: currentTab, category: cat, date
+    });
+    if (error) { alert('추가 실패: ' + error.message); return; }
 
     document.getElementById('desc').value   = '';
     document.getElementById('amount').value = '';
+
+    // 입력한 날짜가 다른 달이면 해당 달로 이동해 바로 보이도록
+    const [y, m] = date.split('-').map(Number);
+    if (y !== viewYear || (m - 1) !== viewMonth) {
+      viewYear = y; viewMonth = m - 1;
+      updateMonthLabel();
+    }
+    await render();
   }
 
   // ── 삭제 ─────────────────────────────────────────────
-  function deleteTransaction(id) {
-    const data = loadData().filter(t => t.id !== id);
-    saveData(data);
-    render();
+  async function deleteTransaction(id) {
+    const { error } = await sb.from('transactions').delete().eq('id', id);
+    if (error) { alert('삭제 실패: ' + error.message); return; }
+    await render();
   }
 
-  function clearAll() {
-    const data = loadData();
-    if (!data.length) return;
-    if (confirm('이 달의 모든 내역을 삭제하시겠습니까?')) {
-      saveData([]);
-      render();
-    }
+  async function clearAll() {
+    if (!cachedData.length) return;
+    if (!confirm('이 달의 모든 내역을 삭제하시겠습니까?')) return;
+    const { start, end } = monthRange(viewYear, viewMonth);
+    const { error } = await sb.from('transactions').delete().gte('date', start).lt('date', end);
+    if (error) { alert('삭제 실패: ' + error.message); return; }
+    await render();
   }
 
   // ── 렌더 ─────────────────────────────────────────────
-  function render() {
-    const data  = loadData();
-    const carry = loadCarry();
+  async function render() {
+    const [data, carry] = await Promise.all([loadData(), loadCarry()]);
+    cachedData = data;
 
     // 요약 계산
     const salary = data.filter(t => t.category === '월급').reduce((s,t) => s+t.amount, 0);
@@ -520,7 +556,7 @@
 
     let filtered = data;
     if (currentFilter !== 'all') filtered = data.filter(t => t.type === currentFilter);
-    filtered = [...filtered].sort((a,b) => b.date.localeCompare(a.date) || b.id - a.id);
+    filtered = [...filtered].sort((a,b) => b.date.localeCompare(a.date) || (b.created_at||'').localeCompare(a.created_at||''));
 
     if (!filtered.length) {
       list.innerHTML = '<li class="empty-msg">내역이 없습니다.</li>';
@@ -533,7 +569,7 @@
       const sign = t.type === 'income' ? '+' : '−';
       li.innerHTML = `
         <div class="left">
-          <div class="desc">${escHtml(t.desc)}</div>
+          <div class="desc">${escHtml(t.description)}</div>
           <div class="meta">
             <span class="badge ${t.category}">${t.category}</span>
             ${t.date}
@@ -541,7 +577,7 @@
         </div>
         <div class="right">
           <span class="amount">${sign}${fmt(t.amount)}</span>
-          <button class="del-btn" onclick="deleteTransaction(${t.id})" title="삭제">✕</button>
+          <button class="del-btn" onclick="deleteTransaction('${t.id}')" title="삭제">✕</button>
         </div>
       `;
       list.appendChild(li);
@@ -553,11 +589,11 @@
   }
 
   // ── 이월금액 적용 ──────────────────────────────────────
-  document.getElementById('set-carry-btn').addEventListener('click', () => {
+  document.getElementById('set-carry-btn').addEventListener('click', async () => {
     const val = parseInt(document.getElementById('carryover-input').value || '0');
     if (isNaN(val) || val < 0) { alert('올바른 금액을 입력해주세요.'); return; }
-    saveCarry(val);
-    render();
+    await saveCarry(val);
+    await render();
   });
 
   // ── 월 네비게이션 ─────────────────────────────────────
@@ -566,18 +602,18 @@
       `${viewYear}년 ${viewMonth+1}월`;
   }
 
-  document.getElementById('prev-month').addEventListener('click', () => {
+  document.getElementById('prev-month').addEventListener('click', async () => {
     if (viewMonth === 0) { viewYear--; viewMonth = 11; }
     else viewMonth--;
     updateMonthLabel();
-    render();
+    await render();
   });
 
-  document.getElementById('next-month').addEventListener('click', () => {
+  document.getElementById('next-month').addEventListener('click', async () => {
     if (viewMonth === 11) { viewYear++; viewMonth = 0; }
     else viewMonth++;
     updateMonthLabel();
-    render();
+    await render();
   });
 
   // ── 초기화 ────────────────────────────────────────────
